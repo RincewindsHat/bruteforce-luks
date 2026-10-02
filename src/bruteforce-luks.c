@@ -17,9 +17,8 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include <ctype.h>
-#include <errno.h>
-#include <libcryptsetup.h>
+#include <unistd.h>
+#include <getopt.h>
 #include <locale.h>
 #include <math.h>
 #include <pthread.h>
@@ -28,8 +27,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <stdlib.h>
 #include <sys/time.h>
 #include <time.h>
-#include <unistd.h>
 #include <wchar.h>
+#include <libcryptsetup.h>
+#include <stdbool.h>
 
 #include "version.h"
 
@@ -46,7 +46,8 @@ wchar_t *charset = NULL, *prefix = NULL, *suffix = NULL;
 unsigned int charset_len, min_len = 1, max_len = 8, prefix_len = 0, suffix_len = 0;
 FILE *dictionary = NULL;
 pthread_mutex_t found_password_lock, get_password_lock;
-char stop = 0, found_password = 0;
+volatile bool stop = false;
+bool found_password = false;
 unsigned int nb_threads = 1;
 unsigned char last_pass[LAST_PASS_MAX_SHOWN_LENGTH];
 time_t start_time;
@@ -62,27 +63,22 @@ unsigned int *tab = NULL;
  */
 
 void print_status() {
+	time_t current_time = time(NULL);
+
 	unsigned long long int total_ops = 0;
-	unsigned int i, l;
-	unsigned int l_full = max_len - suffix_len - prefix_len;
-	unsigned int l_skip = min_len - suffix_len - prefix_len;
-	double space = 0;
-	double pw_per_seconds;
-	time_t current_time, eta_time;
-	struct tm *time_info;
-	char datestr[256];
-
-	current_time = time(NULL);
-
-	for (i = 0; i < nb_threads; i++) {
+	for (unsigned int i = 0; i < nb_threads; i++) {
 		total_ops += thread_locals[i].counter;
 	}
 
-	pw_per_seconds = (double)total_ops / (current_time - start_time);
+	double pw_per_seconds = (double)total_ops / (current_time - start_time);
 
+	unsigned int l_full = max_len - suffix_len - prefix_len;
+	unsigned int l_skip = min_len - suffix_len - prefix_len;
+	double space = 0;
+	time_t eta_time;
 	if (dictionary == NULL) {
-		for (l = l_skip; l <= l_full; l++) {
-			space += pow(charset_len, l);
+		for (unsigned int i = l_skip; i <= l_full; i++) {
+			space += pow(charset_len, i);
 		}
 
 		eta_time = ((space - total_ops) / pw_per_seconds) + start_time;
@@ -102,7 +98,8 @@ void print_status() {
 		if (eta_time > 6307000000) {
 			fprintf(stderr, "ETA: more than 200 years :(\n");
 		} else {
-			time_info = localtime(&eta_time);
+			struct tm *time_info = localtime(&eta_time);
+			char datestr[256];
 			if (time_info && (strftime(datestr, 256, "%c", time_info) > 0)) {
 				fprintf(stderr, "ETA: %s\n", datestr);
 			} else {
@@ -114,12 +111,12 @@ void print_status() {
 }
 
 void *status_func(void *arg) {
-	unsigned int i;
+	(void)arg;
 
-	while (stop == 0) {
-		for (i = 0; i < status_interval; i++) {
+	while (!stop) {
+		for (unsigned int i = 0; i < status_interval; i++) {
 			sleep(1);
-			if (stop == 1) {
+			if (stop) {
 				pthread_exit(NULL);
 			}
 		}
@@ -129,7 +126,10 @@ void *status_func(void *arg) {
 	pthread_exit(NULL);
 }
 
-void handle_signal(int signo) { print_status(); }
+void handle_signal(int signo) {
+	(void)signo;
+	print_status();
+}
 
 /*
  * Log function
@@ -148,9 +148,6 @@ void logger(int level, const char *msg, void *usrptr) {
  */
 
 int generate_next_password(unsigned char **pwd, unsigned int *pwd_len) {
-	wchar_t *password;
-	unsigned int password_len, i;
-
 	pthread_mutex_lock(&get_password_lock);
 
 	if (len == 0) {
@@ -172,15 +169,15 @@ int generate_next_password(unsigned char **pwd, unsigned int *pwd_len) {
 	}
 
 	/* Make password */
-	password_len = prefix_len + len + suffix_len;
-	password = (wchar_t *)calloc(password_len + 1, sizeof(wchar_t));
-	if ((password == NULL)) {
+	unsigned int password_len = prefix_len + len + suffix_len;
+	wchar_t *password = (wchar_t *)calloc(password_len + 1, sizeof(wchar_t));
+	if (password == NULL) {
 		fprintf(stderr, "Error: memory allocation failed.\n\n");
 		pthread_mutex_unlock(&get_password_lock);
 		exit(EXIT_FAILURE);
 	}
 	wcsncpy(password, prefix, prefix_len);
-	for (i = 0; i < len; i++) {
+	for (unsigned int i = 0; i < len; i++) {
 		password[prefix_len + i] = charset[tab[len - 1 - i]];
 	}
 	wcsncpy(password + prefix_len + len, suffix, suffix_len);
@@ -201,7 +198,7 @@ int generate_next_password(unsigned char **pwd, unsigned int *pwd_len) {
 	if (tab[0] == charset_len) {
 		tab[0] = 0;
 	}
-	i = 0;
+	unsigned int i = 0;
 	while ((i < len) && (tab[i] == 0)) {
 		i++;
 		tab[i]++;
@@ -221,11 +218,8 @@ int generate_next_password(unsigned char **pwd, unsigned int *pwd_len) {
 }
 
 int read_dictionary_line(unsigned char **line, unsigned int *n) {
-	unsigned int size;
-	int ret;
-
 	*n = 0;
-	size = 32;
+	unsigned int size = 32;
 	*line = (unsigned char *)malloc(size);
 	if (*line == NULL) {
 		fprintf(stderr, "Error: memory allocation failed.\n\n");
@@ -233,25 +227,23 @@ int read_dictionary_line(unsigned char **line, unsigned int *n) {
 	}
 
 	pthread_mutex_lock(&get_password_lock);
-	while (1) {
-		ret = fgetc(dictionary);
+	while (true) {
+		int ret = fgetc(dictionary);
 		if (ret == EOF) {
 			if (*n == 0) {
 				free(*line);
 				*line = NULL;
 				pthread_mutex_unlock(&get_password_lock);
 				return (0);
-			} else {
-				break;
 			}
+			break;
 		}
 
 		if ((ret == '\r') || (ret == '\n')) {
 			if (*n == 0) {
 				continue;
-			} else {
-				break;
 			}
+			break;
 		}
 
 		(*line)[*n] = (unsigned char)ret;
@@ -277,47 +269,46 @@ int read_dictionary_line(unsigned char **line, unsigned int *n) {
 }
 
 void *decryption_func(void *arg) {
-	struct decryption_func_locals *dfargs;
+	struct decryption_func_locals *dfargs = (struct decryption_func_locals *)arg;
+	/* Load the LUKS volume header */
+	struct crypt_device *crypt_device_handle;
+	crypt_init(&crypt_device_handle, path);
+	crypt_load(crypt_device_handle, CRYPT_LUKS, NULL);
+
+	const char *identifier = "bruteforce-luks";
+	crypt_set_log_callback(crypt_device_handle, &logger, identifier);
+
 	unsigned char *pwd;
 	unsigned int pwd_len;
-	int ret;
-	struct crypt_device *cd;
-
-	dfargs = (struct decryption_func_locals *)arg;
-
-	/* Load the LUKS volume header */
-	crypt_init(&cd, path);
-	crypt_load(cd, CRYPT_LUKS, NULL);
-	crypt_set_log_callback(cd, &logger, &ret);
-
 	do {
+		int got_next_pw;
 		if (dictionary == NULL) {
-			ret = generate_next_password(&pwd, &pwd_len);
+			got_next_pw = generate_next_password(&pwd, &pwd_len);
 		} else {
-			ret = read_dictionary_line(&pwd, &pwd_len);
+			got_next_pw = read_dictionary_line(&pwd, &pwd_len);
 		}
-		if (ret == 0) {
+		if (got_next_pw == 0) {
 			break;
 		}
 
 		/* Decrypt the LUKS volume with the password */
-		ret = crypt_activate_by_passphrase(cd, NULL, CRYPT_ANY_SLOT, pwd, pwd_len,
-										   CRYPT_ACTIVATE_READONLY);
+		int ret = crypt_activate_by_passphrase(crypt_device_handle, NULL, CRYPT_ANY_SLOT, pwd,
+											   pwd_len, CRYPT_ACTIVATE_READONLY);
 		if (ret >= 0) {
 			/* We have a positive result */
 			print_status();
 			pthread_mutex_lock(&found_password_lock);
-			found_password = 1;
+			found_password = true;
 			printf("Password found: %s\n", pwd);
-			stop = 1;
+			stop = true;
 			pthread_mutex_unlock(&found_password_lock);
 		}
 		dfargs->counter++;
 
 		free(pwd);
-	} while (stop == 0);
+	} while (!stop);
 
-	crypt_free(cd);
+	crypt_free(crypt_device_handle);
 
 	pthread_exit(NULL);
 }
@@ -365,12 +356,12 @@ void save_state() {
 }
 
 void *state_func(void *arg) {
-	unsigned int i;
+	(void)arg;
 
-	while (stop == 0) {
-		for (i = 0; i < 60; i++) {
+	while (!stop) {
+		for (unsigned int i = 0; i < 60; i++) {
 			sleep(1);
-			if (stop == 1) {
+			if (stop) {
 				pthread_exit(NULL);
 			}
 		}
@@ -381,7 +372,7 @@ void *state_func(void *arg) {
 }
 
 void restore_state() {
-	unsigned int i, n;
+	unsigned int n;
 	unsigned long long int total_ops = 0;
 	unsigned long long int run_time;
 	unsigned char *line;
@@ -481,7 +472,7 @@ void restore_state() {
 			fprintf(stderr, "Error: memory allocation failed.\n\n");
 			exit(EXIT_FAILURE);
 		}
-		for (i = 0; i < len; i++) {
+		for (unsigned int i = 0; i < len; i++) {
 			if (fscanf(state, "%u ", &tab[i]) != 1) {
 				fprintf(stderr, "Error: parsing the state file failed.\n\n");
 				exit(EXIT_FAILURE);
@@ -500,7 +491,7 @@ void restore_state() {
 			exit(EXIT_FAILURE);
 		}
 
-		for (i = 0; i < total_ops; i++) {
+		for (unsigned int i = 0; i < total_ops; i++) {
 			read_dictionary_line(&line, &n);
 		}
 	} else {
@@ -568,15 +559,13 @@ void usage(char *progname) {
 }
 
 int main(int argc, char **argv) {
-	pthread_t *decryption_threads, status_thread, state_thread;
-	int i, ret, c;
-
 	setlocale(LC_ALL, "");
 
 	/* Get options and parameters. */
 	opterr = 0;
-	while ((c = getopt(argc, argv, "b:e:f:hl:m:s:t:v:w:")) != -1) {
-		switch (c) {
+	int option_index;
+	while ((option_index = getopt(argc, argv, "b:e:f:hl:m:s:t:v:w:")) != -1) {
+		switch (option_index) {
 		case 'b':
 			prefix_len = mbstowcs(NULL, optarg, 0);
 			if (prefix_len == (unsigned int)-1) {
@@ -743,7 +732,7 @@ int main(int argc, char **argv) {
 	last_pass[0] = '\0';
 
 	/* Check if path points to a LUKS volume */
-	ret = check_path(path);
+	int ret = check_path(path);
 	if (ret == 0) {
 		fprintf(
 			stderr,
@@ -751,6 +740,8 @@ int main(int argc, char **argv) {
 			path);
 		exit(EXIT_FAILURE);
 	}
+
+	pthread_t status_thread;
 
 	signal(SIGUSR1, handle_signal);
 	if (status_interval > 0) {
@@ -764,7 +755,7 @@ int main(int argc, char **argv) {
 	pthread_mutex_init(&found_password_lock, NULL);
 	pthread_mutex_init(&get_password_lock, NULL);
 
-	decryption_threads = (pthread_t *)malloc(nb_threads * sizeof(pthread_t));
+	pthread_t *decryption_threads = (pthread_t *)malloc(nb_threads * sizeof(pthread_t));
 	thread_locals =
 		(struct decryption_func_locals *)calloc(nb_threads, sizeof(struct decryption_func_locals));
 	if ((decryption_threads == NULL) || (thread_locals == NULL)) {
@@ -774,6 +765,7 @@ int main(int argc, char **argv) {
 
 	start_time = time(NULL);
 
+	pthread_t state_thread;
 	if (state_file != NULL) {
 		restore_state();
 
@@ -785,7 +777,7 @@ int main(int argc, char **argv) {
 	}
 
 	/* Start decryption threads. */
-	for (i = 0; i < nb_threads; i++) {
+	for (unsigned int i = 0; i < nb_threads; i++) {
 		ret = pthread_create(&decryption_threads[i], NULL, &decryption_func, &thread_locals[i]);
 		if (ret != 0) {
 			perror("Error: decryption thread");
@@ -793,10 +785,10 @@ int main(int argc, char **argv) {
 		}
 	}
 
-	for (i = 0; i < nb_threads; i++) {
+	for (unsigned int i = 0; i < nb_threads; i++) {
 		pthread_join(decryption_threads[i], NULL);
 	}
-	stop = 1;
+	stop = true;
 	if (state_file != NULL) {
 		pthread_join(state_thread, NULL);
 	}
@@ -804,7 +796,7 @@ int main(int argc, char **argv) {
 		pthread_join(status_thread, NULL);
 	}
 
-	if (found_password == 0) {
+	if (!found_password) {
 		print_status();
 		fprintf(stderr, "Password not found\n");
 	}
